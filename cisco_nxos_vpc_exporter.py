@@ -62,7 +62,19 @@ _host_locks = {}
 _pool_lock = threading.Lock()
 
 
-def _get_host_lock(host):
+def _get_host_lock(host: str) -> threading.Lock:
+    """Return the lock associated with a target host.
+
+    Creates and stores a new lock if the host does not already have one.
+    A shared pool lock protects concurrent access to the host-lock registry.
+
+    Args:
+        host: Target switch hostname or IP address.
+
+    Returns:
+        The thread lock associated with the target host.
+    """
+    
     with _pool_lock:
         lock = _host_locks.get(host)
         if lock is None:
@@ -71,7 +83,16 @@ def _get_host_lock(host):
         return lock
 
 
-def _build_device_params(host):
+def _build_device_params(host: str) -> dict:
+    """Build Netmiko connection parameters for a Cisco NX-OS device.
+
+    Args:
+        host: Target switch hostname or IP address.
+
+    Returns:
+        A dictionary of connection parameters accepted by Netmiko.
+    """
+    
     return {
         "device_type": "cisco_nxos",
         "host": host,
@@ -85,10 +106,21 @@ def _build_device_params(host):
     }
 
 
-def _ensure_alive(host):
-    """Return a live connection for host, reusing the cached one if
-    possible, reconnecting only if it's actually dead. Caller must
-    already hold _get_host_lock(host)."""
+def _ensure_alive(host: str) -> ConnectHandler::
+    """Return an active SSH connection, creating or replacing it if necessary.
+
+    Reuses the cached connection when it is alive. Otherwise, attempts
+    to close the stale connection and establishes a new SSH session.
+
+    The caller must hold the lock associated with the target host.
+
+    Args:
+        host: Target switch hostname or IP address.
+
+    Returns:
+        An active Netmiko connection.
+    """
+    
     conn = _connections.get(host)
     if conn is not None:
         try:
@@ -109,15 +141,27 @@ def _ensure_alive(host):
     return conn
 
 
-def run_commands(host, commands):
-    """Run a list of commands over the persistent session for host.
+def run_commands(host: str, commands: list[str]) -> dict[str, str]:
+    """Execute commands over a persistent SSH connection.
 
-    Reuses the existing session if alive. On any failure, drops the
-    session and retries exactly once with a fresh connection before
-    giving up (handles the case where the switch rebooted, the vty
+    Serializes command execution for each target host while allowing
+    concurrent operations against different hosts. If command execution
+    fails, discards the existing connection and retries once using a
+    new SSH session.(handles the case where the switch rebooted, the vty
     was cleared, etc. without paying the reconnect cost on every
     healthy scrape).
+
+    Args:
+        host: Target switch hostname or IP address.
+        commands: List of CLI commands to execute.
+
+    Returns:
+        A dictionary mapping each command to its output.
+
+    Raises:
+        Exception: If command execution fails after the retry attempt.
     """
+    
     lock = _get_host_lock(host)
     with lock:
         last_err = None
@@ -142,20 +186,61 @@ def run_commands(host, commands):
 
 
 # ---------------- Metric collection ----------------
-def _safe_lower(value):
+def _safe_lower(value: object) -> str:
+    """Normalize a string value to lowercase.
+    
+    Returns an empty string when the input is not a string.
+
+    Args:
+        value: Value to normalize.
+
+    Returns:
+        Lowercase string or an empty string.
+    """
+    
     return value.lower() if isinstance(value, str) else ""
 
 
-def _rows_as_list(table, row_key):
-    """NX-OS `| json` quirk: ROW_x is a dict (not a list) when there's
-    exactly one row. Normalize to a list either way."""
+def _rows_as_list(table: dict, row_key: str) -> list[dict]:
+    """Normalize NX-OS JSON table rows into a list.
+
+    NX-OS JSON output represents a single row as a dictionary but
+    multiple rows as a list. This helper provides a consistent list
+    representation for both cases.
+
+    Args:
+        table: Dictionary containing the NX-OS table data.
+        row_key: Key identifying the rows within the table.
+
+    Returns:
+        A list of row dictionaries, or an empty list if no rows exist.
+    """
+
     rows = table.get(row_key, [])
     if isinstance(rows, dict):
         return [rows]
     return rows or []
 
 
-def collect_vpc_metrics(switch_name, vpc_output, keepalive_output, registry):
+def collect_vpc_metrics(
+    switch_name: str,
+    vpc_output: str,
+    keepalive_output: str,
+    registry: CollectorRegistry,
+) -> None:
+    """Parse VPC command outputs and expose Cisco NX-OS metrics.
+
+    Extracts VPC peer, keepalive, consistency, uptime, and port-channel
+    information from the JSON command outputs. Normalizes the extracted
+    values and registers the corresponding Prometheus metrics.
+
+    Args:
+        switch_name: Hostname or IP address of the target switch.
+        vpc_output: JSON output from the VPC brief command.
+        keepalive_output: JSON output from the peer-keepalive command.
+        registry: Prometheus registry used to register the metrics.
+    """
+    
     raw_data = json.loads(vpc_output)
     keepalive_data = json.loads(keepalive_output)
 
@@ -218,6 +303,7 @@ def collect_vpc_metrics(switch_name, vpc_output, keepalive_output, registry):
     vpc_per_vlan_peer_consistency = _safe_lower(raw_data.get("vpc-per-vlan-peer-consistency"))
     vpc_peer_consistency_status = _safe_lower(raw_data.get("vpc-peer-consistency-status"))
 
+    # Could be used for debugging
     # vpcs = {}
     # for row in raw_data.get("TABLE_vpc").get("ROW_vpc"):
     #     vpcs[row["vpc-ifindex"]] = {
@@ -349,7 +435,15 @@ def collect_vpc_metrics(switch_name, vpc_output, keepalive_output, registry):
         "vpcs": vpcs,
     }, indent=3))
 
-def get_pool_health():
+def get_pool_health()-> dict:
+    """Return the current health status of pooled SSH connections.
+
+    Checks cached connections and summarizes their status by target host.
+
+    Returns:
+        A dictionary containing connection counts and per-host status.
+    """
+    
     alive = 0
     dead = 0
     hosts = {}
@@ -380,6 +474,20 @@ def get_pool_health():
 
 # ---------------- WSGI App ----------------
 def app(environ, start_response):
+    """Handle WSGI requests for health checks and Prometheus metrics.
+
+    Supports:
+        GET /health: Returns SSH connection pool health information.
+        GET /metrics?target=<switch-host>: Collects VPC metrics.
+
+    Args:
+        environ: WSGI environment containing HTTP request information.
+        start_response: WSGI callable used to send the HTTP response.
+
+    Returns:
+        An iterable containing the HTTP response body.
+    """
+    
     path = environ.get("PATH_INFO", "")
 
     if path == "/health":
