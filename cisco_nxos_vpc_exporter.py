@@ -51,7 +51,7 @@ KEEPALIVE_CMD = "show vpc peer-keepalive | json"
 
 
 
-# ---------------- Persistent connection pool (no classes) ----------------
+# ---------------- Persistent connection pool ----------------
 # _connections: host -> live netmiko connection object (or missing/None)
 # _host_locks: host -> threading.Lock, one per target so concurrent scrapes
 #              of the SAME host serialize, while different hosts don't
